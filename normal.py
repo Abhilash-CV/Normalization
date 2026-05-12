@@ -2,148 +2,123 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="KEAM Normalization", layout="wide")
+st.title("KEAM Normalization")
 
-st.title("KEAM 2026 Normalization Calculator")
-
-uploaded_file = st.file_uploader(
-    "Upload Excel File",
-    type=["xlsx"]
-)
-
-def interpolate_score(target_percentile, batch_df):
-    """
-    Find interpolated score for target percentile
-    from another session/batch.
-    """
-
-    df = batch_df.sort_values("Percentile").reset_index(drop=True)
-
-    # Exact match
-    exact = df[np.isclose(df["Percentile"], target_percentile)]
-
-    if not exact.empty:
-        return float(exact.iloc[0]["Score"])
-
-    # Lower percentile row
-    lower = df[df["Percentile"] < target_percentile]
-
-    # Higher percentile row
-    higher = df[df["Percentile"] > target_percentile]
-
-    # If no lower found -> minimum score
-    if lower.empty:
-        return float(df.iloc[0]["Score"])
-
-    # If no higher found -> maximum score
-    if higher.empty:
-        return float(df.iloc[-1]["Score"])
-
-    lower_row = lower.iloc[-1]
-    higher_row = higher.iloc[0]
-
-    p1 = lower_row["Percentile"]
-    p2 = higher_row["Percentile"]
-
-    s1 = lower_row["Score"]
-    s2 = higher_row["Score"]
-
-    # Linear interpolation
-    interpolated = s1 + (
-        (target_percentile - p1) / (p2 - p1)
-    ) * (s2 - s1)
-
-    return float(interpolated)
+uploaded_file = st.file_uploader("Upload Excel", type=["xlsx"])
 
 if uploaded_file:
 
     df = pd.read_excel(uploaded_file)
 
-    required_cols = ["RollNo", "Batch", "Percentile", "Score"]
+    df = df.sort_values(["Batch", "Percentile"])
 
-    for col in required_cols:
-        if col not in df.columns:
-            st.error(f"Missing column: {col}")
-            st.stop()
-
-    # Get all batches
     batches = sorted(df["Batch"].unique())
 
-    output_rows = []
+    # PREPROCESS ONCE
+    batch_lookup = {}
 
-    for idx, row in df.iterrows():
+    for batch in batches:
 
-        roll = row["RollNo"]
-        current_batch = row["Batch"]
-        percentile = row["Percentile"]
-        original_score = row["Score"]
+        temp = df[df["Batch"] == batch]
 
-        result = {
-            "RollNo": roll,
-            "Batch": current_batch,
-            "Percentile": percentile,
-            "Score": original_score
+        batch_lookup[batch] = {
+            "percentiles": temp["Percentile"].to_numpy(),
+            "scores": temp["Score"].to_numpy()
         }
 
-        all_scores = [original_score]
+    def interpolate_score(percentile, p_arr, s_arr):
 
-        score_col_no = 2
+        idx = np.searchsorted(p_arr, percentile)
+
+        # Below minimum
+        if idx == 0:
+            return float(s_arr[0])
+
+        # Above maximum
+        if idx >= len(p_arr):
+            return float(s_arr[-1])
+
+        p1 = p_arr[idx - 1]
+        p2 = p_arr[idx]
+
+        s1 = s_arr[idx - 1]
+        s2 = s_arr[idx]
+
+        # Exact match
+        if p1 == percentile:
+            return float(s1)
+
+        if p2 == percentile:
+            return float(s2)
+
+        # Interpolation
+        return float(
+            s1 + ((percentile - p1) / (p2 - p1)) * (s2 - s1)
+        )
+
+    output = []
+
+    total_batches = len(batches)
+
+    progress = st.progress(0)
+
+    rows = list(df.itertuples(index=False))
+
+    total_rows = len(rows)
+
+    for i, row in enumerate(rows):
+
+        percentile = row.Percentile
+        current_batch = row.Batch
+
+        scores = []
+
+        row_data = {
+            "RollNo": row.RollNo,
+            "Batch": current_batch,
+            "Percentile": percentile,
+            "Score": row.Score
+        }
+
+        scores.append(row.Score)
+
+        score_index = 2
 
         for batch in batches:
 
             if batch == current_batch:
                 continue
 
-            batch_df = df[df["Batch"] == batch]
-
             interp_score = interpolate_score(
                 percentile,
-                batch_df
+                batch_lookup[batch]["percentiles"],
+                batch_lookup[batch]["scores"]
             )
 
-            result[f"Score{score_col_no}"] = interp_score
+            row_data[f"Score{score_index}"] = interp_score
 
-            all_scores.append(interp_score)
+            scores.append(interp_score)
 
-            score_col_no += 1
+            score_index += 1
 
-        # Average = Normalized score
-        norm_score = np.mean(all_scores)
+        row_data["Norm_Score"] = round(np.mean(scores), 4)
 
-        result["Norm_Score"] = round(norm_score, 4)
+        output.append(row_data)
 
-        output_rows.append(result)
+        if i % 1000 == 0:
+            progress.progress(i / total_rows)
 
-    out_df = pd.DataFrame(output_rows)
+    out_df = pd.DataFrame(output)
 
-    # Reorder columns
-    cols = list(out_df.columns)
+    st.success("Completed")
 
-    fixed_cols = ["RollNo", "Batch", "Percentile", "Score"]
+    st.dataframe(out_df)
 
-    score_cols = sorted(
-        [c for c in cols if c.startswith("Score") and c != "Score"],
-        key=lambda x: int(x.replace("Score", ""))
-    )
+    out_df.to_excel("normalized_output.xlsx", index=False)
 
-    final_cols = fixed_cols + score_cols + ["Norm_Score"]
-
-    out_df = out_df[final_cols]
-
-    st.success("Normalization Completed")
-
-    st.dataframe(out_df, use_container_width=True)
-
-    # Download
-    output_file = "keam_normalized_output.xlsx"
-
-    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        out_df.to_excel(writer, index=False)
-
-    with open(output_file, "rb") as f:
+    with open("normalized_output.xlsx", "rb") as f:
         st.download_button(
-            label="Download Output Excel",
-            data=f,
-            file_name=output_file,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "Download Output",
+            f,
+            file_name="normalized_output.xlsx"
         )
